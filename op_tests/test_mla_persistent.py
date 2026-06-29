@@ -19,6 +19,10 @@ from typing import Union
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+# Set by --mimic-vllm-metadata; when True, get_mla_metadata_v1 is called without
+# dtype_q/dtype_kv (mirroring vLLM) to reproduce the fp8 nhead=32 decode bug.
+MIMIC_VLLM_METADATA = False
+
 
 def dump_mla_metadata_v1_txt(
     filepath: Union[str, Path],
@@ -1092,6 +1096,13 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
+    # When --mimic-vllm-metadata is set, omit dtype_q/dtype_kv to reproduce how
+    # vLLM's rocm_aiter_mla backend calls get_mla_metadata_v1 (it leaves these
+    # Optional args as None). For the gfx950 fp8/fp8 nhead=32 qlen=1 fold path
+    # this silently produces wrong split/reduce metadata -> NaN/garbage decode.
+    metadata_dtype_kwargs = (
+        {} if MIMIC_VLLM_METADATA else {"dtype_q": dtype, "dtype_kv": kvtype}
+    )
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -1112,8 +1123,7 @@ def test_mla(
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        **metadata_dtype_kwargs,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
@@ -1431,7 +1441,12 @@ def test_mla(
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
-        if not non_persistent_mode:
+        # The torch split-reduce reference below re-walks the SAME persistent
+        # metadata as the kernel, so under --mimic-vllm-metadata it consumes the
+        # corrupted metadata and crashes before the clean check. Skip it in that
+        # mode; cal_diff() below compares the kernel against the
+        # metadata-independent golden reference, which is the signal we want.
+        if not non_persistent_mode and not MIMIC_VLLM_METADATA:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
                     q_fp8 if dtype == dtypes.fp8 else q,
@@ -1758,8 +1773,18 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--mimic-vllm-metadata",
+    action="store_true",
+    help="""Call get_mla_metadata_v1 WITHOUT dtype_q/dtype_kv, the way vLLM's
+    rocm_aiter_mla backend does. Reproduces the gfx950 fp8/fp8 nhead=32 qlen=1
+    decode accuracy bug (NaN/garbage). Default: False (dtypes passed, test
+    passes).
+    e.g.: -n 32,1 -d fp8 -kvd fp8 -c 8192 -b 128 --mimic-vllm-metadata""",
+)
 
 args = parser.parse_args()
+MIMIC_VLLM_METADATA = args.mimic_vllm_metadata
 for nhead, decode_qlen in args.nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
