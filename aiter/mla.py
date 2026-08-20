@@ -279,7 +279,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache
-def get_meta_param(
+def _get_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -368,10 +368,58 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
+    return num_kv_splits
+
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Pick the split count and build the matching uniform split indptr.
+
+    The split-count heuristic is pure and worth caching. The indptr is not, and
+    must be rebuilt per call: it is a device tensor, and returning a cached one
+    is unsafe under CUDA graph capture.
+
+    `torch.arange` on CUDA is a fill kernel. Built here on every call, that
+    kernel is recorded into any graph capturing this region and re-runs on
+    every replay, so the buffer is re-initialised every time -- correct by
+    construction regardless of what the caching allocator does with the storage
+    in between. Returned from a cache instead, a capture that hits the cache
+    records only a pointer and no producing kernel; when the cache later drops
+    that entry -- it was the tensor's only owner -- the storage is recycled and
+    replay reads whatever now lives there. Downstream that is
+    `_fwd_kernel_stage2_asm` deriving `num_valid_kv_splits` from garbage and
+    indexing past the end of `Mid_O`.
+
+    Eviction is not a remote possibility: `total_kv` is part of the key and
+    changes almost every decode step, while entries captured into a graph are
+    never looked up again (replay runs no host code), so they are exactly what
+    an LRU discards first. See op_tests/test_mla_split_indptr_cudagraph.py.
+
+    Rebuilding also fixes a latent multi-device bug: the cached tensor was
+    allocated on the then-current device with no device in the key, so a second
+    device could be handed the first one's tensor.
+    """
+    num_kv_splits = _get_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
-
     return num_kv_splits, num_kv_splits_indptr
 
 
