@@ -219,10 +219,20 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             not args.kv_preshuffle or blocksize % 16 == 0 or blocksize == 8
         ), f"Preshuffle needs a page that is a multiple of the 16-token MFMA tile, or 8; got {blocksize}."
 
-        var_ratio = 0.5
+        # Context lengths are drawn uniform in [(1-r)*L, (1+r)*L]. The default
+        # 0.5 is a 3x spread, which is the case the varctx schedule exists to
+        # fix -- and it is not the case a long-context server runs. vLLM sparse
+        # MLA decode at ISL 115k / OSL 1000 holds every context within ~1 % of
+        # the same length, i.e. r ~ 0.004. Benchmarking varctx at r=0.5 and
+        # concluding it wins is the same error as benchmarking at ChunkK=128
+        # when the server runs 256.
+        var_ratio = args.var_ratio
         # varctx gluon kernel only exists on the preshuffle path; passing a
-        # varctx schedule to the base kernel breaks compile (signature mismatch).
-        EnableVarCtxOpt = var_ratio > 0.0 and args.kv_preshuffle and not args.no_varctx
+        # varctx schedule to the base kernel breaks compile (signature
+        # mismatch). It is NOT gated on var_ratio: the schedule is well defined
+        # at uniform context too, and whether it still pays there is exactly
+        # the question --var-ratio 0 is for.
+        EnableVarCtxOpt = args.kv_preshuffle and not args.no_varctx
 
         context_lens = (
             torch.randint(
@@ -333,6 +343,7 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
                 )
 
+            safe_chunks_per_cta = None
             if EnableVarCtxOpt:
                 safe_chunks_per_cta = deepgemm_fp8_paged_mqa_logits_schedule(
                     batch_size,
@@ -521,6 +532,14 @@ if __name__ == "__main__":
         "--no-varctx",
         action="store_true",
         help="Disable varctx schedule (only applies with --kv_preshuffle)",
+    )
+    parser.add_argument(
+        "--var-ratio",
+        type=float,
+        default=0.5,
+        help="Context-length spread: lengths are uniform in [(1-r)*L, (1+r)*L]. "
+        "The 0.5 default is a 3x spread and flatters the varctx schedule. A "
+        "long-context server is near-uniform -- ISL 115k / OSL 1000 is r~0.004.",
     )
     parser.add_argument(
         "--chunk-k",
