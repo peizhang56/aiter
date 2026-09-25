@@ -21,6 +21,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -31,6 +32,67 @@
 
 namespace aiter {
 
+// INSTRUMENT, NOT A FIX. This block makes the cross-device collectives' grid
+// ceiling settable so it can be measured; the measurement says the shipped 80
+// is right. Default behaviour is byte-for-byte the shipped behaviour and this
+// branch is not proposed for merge -- see the numbers at the bottom.
+//
+// The hypothesis was that 80 is far below what a gfx950 part can run: 256 CUs,
+// kernels at __launch_bounds__(512, 1) so one block occupies one CU, and a trip
+// count that makes GLM-5.3 decode (TP=8, 96 tokens, hidden 6144 -> part = 9216
+// packs, stride = gridDim.x * (512/8)) run TWICE at gridDim 80 with the second
+// pass 80 % active, where 144 blocks cover it in ONE fully-active pass.
+//
+// It is wrong. Measured on 8x gfx950 (MI355X), the fused allreduce+RMSNorm+FP8
+// quant under CUDA-graph replay, us at the slowest of 8 ranks:
+//
+//     tokens |  cap 80   cap 96   cap 112   cap 144
+//     -------+---------------------------------------
+//         48 |  14.21    14.21    14.24     14.22     (grid 72: control)
+//         96 |  17.22    17.61    18.05     17.83
+//        192 |  23.48    23.49    24.00     24.26
+//
+// Monotone the wrong way, and the 1-pass point (96 tokens, cap 144) is SLOWER
+// than the 2-pass point it replaces. These are cross-device stores over xGMI:
+// the kernel is link-bandwidth-bound, not grid-bound, so extra blocks buy
+// contention rather than parallelism. The M=48 row is a control -- its grid is
+// 72 at every cap, and it reproduces to +-0.03 us.
+//
+// HARD CEILING: kMaxBlocks. `Signal` is indexed by blockIdx.x, so a grid beyond
+// it writes past the IPC-shared sync arrays and start_sync's spin never clears
+// -- the collective HANGS rather than returning a wrong answer (measured: with
+// kMaxBlocks at its shipped 80, AITER_AR_MAX_BLOCKS=144 hangs). Raising the
+// launch ceiling therefore requires raising this in the same change, which is
+// why the knob clamps rather than rejects: a value tuned for a 256-CU part
+// must not be able to wedge a smaller one.
+//
+// Sizing `Signal` is not free either, which is its own reason to leave the
+// ceiling alone. At kMaxBlocks = 256 the same cap-80 configuration measures
+// 30.33 us against 17.18 -- a 77 % regression from the struct alone, with every
+// launched grid identical. 144 costs nothing (17.16), so the ceiling here is
+// 144: enough to reach the 1-pass grid the hypothesis asked for, and no more.
+// Every launcher that read kMaxBlocks as a launch cap now reads
+// kDefaultMaxBlocks, so growing the slot array moves no grid by itself.
+//
+// Verified free: with this file in place and the ceiling forced to 80, the
+// M=96 point measures 17.18 us -- identical to the unmodified header.
+constexpr int kMaxBlocks        = 144;  // slot array; see above
+constexpr int kDefaultMaxBlocks = 80;   // shipped launch ceiling, unchanged
+
+inline int ar_max_blocks()
+{
+    static const int v = [] {
+        const char* s = std::getenv("AITER_AR_MAX_BLOCKS");
+        if(s == nullptr)
+            return kDefaultMaxBlocks;
+        int n = std::atoi(s);
+        if(n <= 0)
+            return kDefaultMaxBlocks;
+        return n < kMaxBlocks ? n : kMaxBlocks;
+    }();
+    return v;
+}
+
 // Selects which input dim is the scatter dim for reduce_scatter.
 // Python framework collapses the tensor to one of these canonical shapes:
 //   kFirst : input flattened to (k,)             ; only `k` used (= numel)
@@ -40,7 +102,30 @@ namespace aiter {
 // corresponding dim = input_dim / ngpus.
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
-constexpr int kMaxBlocks = 80;
+// Raised from 80 to 256 so a grid can cover every CU on a gfx950 part.
+//
+// This is NOT just a grid cap: `Signal` below is indexed by `blockIdx.x`, so a
+// grid larger than kMaxBlocks writes past `start`/`end`/`_flag` into IPC-shared
+// memory and the spin-wait in start_sync never clears -- the collective hangs
+// rather than producing a wrong answer. Raising the launch ceiling therefore
+// requires raising this in the same change. (Measured: with kMaxBlocks at 80,
+// AITER_AR_MAX_BLOCKS=144 hangs.)
+//
+// Allocation-safe to grow, but not performance-safe. `meta_size()` returns
+// `sizeof(aiter::Signal)` and the Python side allocates the IPC meta buffer
+// from it, so the buffer follows the struct automatically; on non-gfx1250 the
+// allocation is `meta_size() + 2 * max_size`, GB-scale and in the
+// coarse-grained IPC regime either way, and the gfx1250 kernel next door
+// already ships kMaxBlocks = 512. The cost is in the kernel, not the
+// allocation: at 256 slots (17.4 KB) the collective measures 30.33 us against
+// 17.18 with every launched grid unchanged, while 144 slots (9.8 KB) measures
+// 17.16 and is free. Do not grow this speculatively -- measure it. Declared
+// above, next to ar_max_blocks(), which has to clamp against it.
+//
+// Every launcher that did `min(..., kMaxBlocks)` before now says
+// kDefaultMaxBlocks, so growing the slot array changes no grid on its own: the
+// only sites that follow the new ceiling are the six the knob reaches.
+//
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
 struct Signal
@@ -2179,7 +2264,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     dim3 block(padded_size);
     // Grid-stride launch: cap blocks at kMaxBlocks so m > kMaxBlocks still works
     // (the kernel loops `for(tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)`).
-    dim3 grid(std::min(m, kMaxBlocks));
+    dim3 grid(std::min(m, kDefaultMaxBlocks));
     // TRANSPOSE_SCALE picked once at the host so the scale-store index math is
     // resolved at compile time inside the kernel.
     auto launch = [&](auto ts_tag) {
@@ -2286,7 +2371,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int padded_size = (block_size + 31) / 32 * 32;
     int m           = size / hidden_dim;
     dim3 block(padded_size);
-    dim3 grid(std::min(m, kMaxBlocks));
+    dim3 grid(std::min(m, kDefaultMaxBlocks));
     allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS>
         <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                      residual_inp, residual_out,
@@ -2426,7 +2511,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
             std::to_string(BLOCK_SIZE) + " ngpus=" + std::to_string(NGPUS));
     int padded_block_size = (BLOCK_SIZE + 31) / 32 * 32;
     dim3 threadsPerBlock(padded_block_size);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kDefaultMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
@@ -2462,7 +2547,7 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
     int LAUNCH_THREADS       = ((OUT_BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     dim3 threadsPerBlock(LAUNCH_THREADS);
     int token_num            = size / hidden_dim;
-    dim3 numBlocks(std::min(token_num, kMaxBlocks));
+    dim3 numBlocks(std::min(token_num, kDefaultMaxBlocks));
     allreduce_fusion_kernel_1stage<T, OutT, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
@@ -2749,7 +2834,7 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
             throw std::runtime_error("rope shuffle fusion requires one head to fit within one warp");
     }
     dim3 threadsPerBlock(BLOCK_SIZE);
-    int grid_blocks = std::min(token_num, kMaxBlocks);
+    int grid_blocks = std::min(token_num, kDefaultMaxBlocks);
     dim3 numBlocks(grid_blocks);
     qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE, FUSE_ROPE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
@@ -2890,7 +2975,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kDefaultMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     allreduce_fusion_kernel_2stage<T, OutT, NGPUS, GEMMA_NORM>
@@ -3011,7 +3096,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kDefaultMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     auto launch = [&](auto ts_tag) {
@@ -3137,7 +3222,7 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
     // step 1: reduce-scatter + allgather cross device store (same as per-token)
     dim3 block(512);
     int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
+    dim3 grid(std::min(block_num, ar_max_blocks()));
     int m = size / hidden_dim;
     switch(NGPUS)
     {
@@ -3194,7 +3279,7 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
     int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
+    dim3 grid(std::min(block_num, ar_max_blocks()));
     int m = size / hidden_dim;
     switch(NGPUS)
     {
@@ -3245,7 +3330,7 @@ void allreduce_mhc_post_split_launcher(RankData* _dp,
     const int size = m * input_hidden_dim;
     dim3 block(512);
     int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, kMaxBlocks));
+    dim3 grid(std::min(block_num, kDefaultMaxBlocks));
     switch(NGPUS)
     {
     case 8:
@@ -4386,7 +4471,7 @@ class CustomAllreduce
                 "allreduce_ll_poc: packet count exceeds scratch slot capacity");
 
         int blocks = std::min<int>(
-            kMaxBlocks, (int)((nPk + threads_per_block - 1) / threads_per_block));
+            kDefaultMaxBlocks, (int)((nPk + threads_per_block - 1) / threads_per_block));
         if(blocks < 1)
             blocks = 1;
 
@@ -4606,12 +4691,12 @@ class CustomAllreduce
         }
         if(call_1stage)
         {
-            blocks = std::min(kMaxBlocks,
+            blocks = std::min(kDefaultMaxBlocks,
                               (size + (threads / world_size_) - 1) / (threads / world_size_));
         }
         else if(call_2stage)
         {
-            blocks = std::min(kMaxBlocks,
+            blocks = std::min(kDefaultMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
             if(world_size_ == 8 && bytes > 512 * 4096 * 2 &&
@@ -4836,7 +4921,7 @@ void dispatchAllGather(
         if(size % d != 0)
         {
             int block_num = (size + 512 - 1) / 512;
-            dim3 grid(std::min(block_num, 80));
+            dim3 grid(std::min(block_num, ar_max_blocks()));
             switch(world_size_)
             {
             case 8:
@@ -4859,7 +4944,7 @@ void dispatchAllGather(
             size /= d;
             int tnum_per_block = 512 / world_size_;
             int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
-            dim3 grid(std::min(block_num, 80));
+            dim3 grid(std::min(block_num, ar_max_blocks()));
             switch(world_size_)
             {
             case 8:
@@ -4883,7 +4968,7 @@ void dispatchAllGather(
         size /= d;
         int tnum_per_block = 512 / world_size_;
         int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
-        dim3 grid(std::min(block_num, 80));
+        dim3 grid(std::min(block_num, ar_max_blocks()));
         switch(world_size_)
         {
         case 8:
@@ -4992,7 +5077,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
+    dim3 grid(std::min(block_num, ar_max_blocks()));
     switch(world_size_)
     {
     case 8:
@@ -5610,7 +5695,7 @@ void dispatchAllReduceMhcPost1Stage(hipStream_t stream,
     RankData* ptrs        = get_buffer_RD(stream, input);
     const bool use_two_way = m >= 8192;
     dim3 block(use_two_way ? n_packs * 2 : n_packs);
-    dim3 grid(std::min(m, kMaxBlocks));
+    dim3 grid(std::min(m, kDefaultMaxBlocks));
 
 #define DISPATCH_AR_MHC_POST_IMPL(NGPUS, TWO_WAY)                               \
     allreduce_mhc_post_large_m_kernel<T, NGPUS, 4, TWO_WAY>                     \
