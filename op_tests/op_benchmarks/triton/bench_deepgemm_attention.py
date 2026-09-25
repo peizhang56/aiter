@@ -192,8 +192,13 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 
 
 def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
-    ChunkK = 128
-    WavePerEU = 5
+    # Defaults kept at the values this benchmark has always used, but a caller
+    # that knows its own serving config has to be able to say so: vLLM's sparse
+    # MLA decode path calls this op with ChunkK=256 / WavePerEU=2, and WavePerEU
+    # is a direct multiplier in the decode SplitKV formula, so benchmarking 128/5
+    # measures a launch geometry no server runs.
+    ChunkK = args.chunk_k
+    WavePerEU = args.wave_per_eu
     rows = []
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
@@ -516,6 +521,19 @@ if __name__ == "__main__":
         "--no-varctx",
         action="store_true",
         help="Disable varctx schedule (only applies with --kv_preshuffle)",
+    )
+    parser.add_argument(
+        "--chunk-k",
+        type=int,
+        default=128,
+        help="K tile per chunk. vLLM sparse MLA decode uses 256.",
+    )
+    parser.add_argument(
+        "--wave-per-eu",
+        type=int,
+        default=5,
+        help="Waves per EU; a direct multiplier in the decode SplitKV formula. "
+        "vLLM sparse MLA decode uses 2.",
     )
     parser.add_argument(
         "--data-init",
