@@ -1,0 +1,85 @@
+{
+    "_comment": [
+        "B=8 specialization of the N=256-K=512 file. This is the MLA output",
+        "absorption x -> W_V for a 64-head model at TP=8 (GLM-5.3: v_head_dim",
+        "256, kv_lora_rank 512, 64/8 = 8 local heads); it runs once per layer",
+        "beside the q_nope -> W_K absorb in the B=8-N=512-K=192 file, and the",
+        "same reasoning applies -- see that file's comment for why B belongs in",
+        "the key. Every tile below was measured bit-identical to the shipped one",
+        "(max abs diff 0.00e+00).",
+        "",
+        "Measured by graph replay on MI355X, us per call, best tile vs shipped:",
+        "  M=32  5.4  -> 5.3 (-1 %)    M=48   13.4 -> 5.3 (-60 %)",
+        "  M=64  9.1  -> 5.4 (-41 %)   M=80   15.2 -> 5.4 (-65 %)",
+        "  M=96  15.2 -> 5.4 (-65 %)   M=128  9.1  -> 5.4 (-40 %)",
+        "  M=192 9.1  -> 5.4 (-40 %)   M=256  9.1  -> 5.5 (-40 %)",
+        "  M=512 5.9  -> 5.8 (-2 %)    M=1024 10.8 -> 7.4 (-31 %)",
+        "",
+        "M >= 1536 keeps the shipped large-M tile. 32x256 w8 was 13 % faster at",
+        "M=2048 and M=4608, but it is a wash at M=11588 -- the width a 115k-token",
+        "prefill actually presents -- so the prefill path is left alone rather",
+        "than retuned for widths this deployment does not produce.",
+        "bench_mla_bmm_config.py in the GLM-5.3 tree regenerates the whole table."
+    ],
+    "M_BOUNDS": [16, 24, 32, 512, 1536],
+    "M_LEQ_16": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_24": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_32": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_512": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_1536": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "any": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null
+    }
+}

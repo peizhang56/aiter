@@ -1,0 +1,100 @@
+{
+    "_comment": [
+        "B=8 specialization of the N=512-K=192 file. This is MLA q_nope -> W_K",
+        "absorption for a 64-head model at TP=8 (GLM-5.3: kv_lora_rank 512,",
+        "qk_nope_head_dim 192, 64/8 = 8 local heads).",
+        "",
+        "The (N, K)-only file is tuned at a larger B and picks BLOCK_SIZE_M 64 x",
+        "BLOCK_SIZE_N 256 for 32 <= M <= 256. The grid is",
+        "(B, cdiv(M, BM) * cdiv(N, BN)), so at B=8 that is 8 * 2 * 2 = 32",
+        "workgroups on a 256-CU gfx950 -- 12.5 % of the device, on a GEMM whose",
+        "0.79 MB of weights put its HBM floor near 0.25 us. Every tile below was",
+        "measured bit-identical to the shipped one (max abs diff 0.00e+00); this",
+        "file only changes how the same work is spread.",
+        "",
+        "Measured by graph replay on MI355X, us per call, best tile vs shipped:",
+        "  M=32  4.4 -> 4.2 (-5 %)    M=48   10.9 -> 4.1 (-62 %)",
+        "  M=64  7.0 -> 4.1 (-41 %)   M=80   12.5 -> 4.2 (-67 %)",
+        "  M=96  12.5 -> 4.2 (-67 %)  M=128  7.0  -> 4.2 (-40 %)",
+        "  M=192 7.1 -> 4.6 (-36 %)   M=256  7.2  -> 4.6 (-35 %)",
+        "  M=512 8.0 -> 5.7 (-28 %)   M=1024 8.7  -> 7.5 (-14 %)",
+        "The M=48/80/96 rows are worst because 64 does not divide them, so the",
+        "shipped tile also loses the EVEN_MN fast path on top of the starved grid.",
+        "",
+        "M >= 1536 keeps the shipped large-M tile: at M=2048..11588 the grid is",
+        "already full and nothing measured beat it by more than run-to-run noise.",
+        "M <= 24 keeps the shipped small-M tiles, which were already best there.",
+        "bench_mla_bmm_config.py in the GLM-5.3 tree regenerates the whole table."
+    ],
+    "M_BOUNDS": [16, 24, 32, 128, 512, 1536],
+    "M_LEQ_16": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_24": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_32": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_128": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_512": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "M_LEQ_1536": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "any": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null
+    }
+}

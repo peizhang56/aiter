@@ -211,11 +211,20 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # B matters here in a way it does not for an unbatched GEMM: the launch grid
+    # is (B, cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)), so B multiplies the
+    # workgroup count and therefore decides whether a given tile fills the
+    # device at all. A tile tuned at large B starves a small one -- at B=8,
+    # M=96, N=512 the (M, N, K)-only config picks 64x256 and launches 32
+    # workgroups onto 256 CUs. Passing B lets a B-specialized file exist;
+    # get_gemm_config falls back to the (N, K) file when none does, so callers
+    # that leave B None are unaffected.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        B=B,
     )
