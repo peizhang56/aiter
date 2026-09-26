@@ -1,4 +1,5 @@
 import inspect
+import os
 
 import torch
 import triton
@@ -65,6 +66,19 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
 # gfx942 (MI300X) LDS size per CU.
 _GFX942_CU_LDS_BYTES = 64 * 1024
+
+
+def _mqa_env_int(name: str, default: int) -> int:
+    """Read an integer tuning override from the environment.
+
+    Returns `default` when the variable is unset or empty, so every override
+    added with this helper is inert by default and the shipped heuristic is
+    bit-identical for callers that do not opt in.
+    """
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return int(v)
 
 
 def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
@@ -236,6 +250,18 @@ def fp8_mqa_logits(
             waves_per_eu = 2 if TRITON_GE_38 else 3
             num_warps = 2
             block_kv = 64
+            # Tuning overrides. Inert unless the env var is set, so this is a
+            # no-op for every caller that does not opt in. They are applied
+            # *here*, before num_kv_splits is derived, because that derivation
+            # reads num_warps and waves_per_eu -- overriding them afterwards
+            # would leave the split count inconsistent with the launch.
+            waves_per_eu = _mqa_env_int("AITER_MQA_WAVES_PER_EU", waves_per_eu)
+            num_warps = _mqa_env_int("AITER_MQA_NUM_WARPS", num_warps)
+            block_kv = _mqa_env_int("AITER_MQA_BLOCK_KV", block_kv)
+            num_buffers = _mqa_env_int("AITER_MQA_NUM_BUFFERS", num_buffers)
+            MIN_BLOCK_M2_WGS = _mqa_env_int(
+                "AITER_MQA_MIN_BLOCK_M2_WGS", MIN_BLOCK_M2_WGS
+            )
             # BLOCK_M=2 halves the grid, so it only pays once there are enough
             # rows to spare or the split puts the workgroups back.
             num_kv_splits = _gfx950_kv_splits(
@@ -262,6 +288,17 @@ def fp8_mqa_logits(
                 num_kv_splits = _gfx950_kv_splits(
                     seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
                 )
+            # Forcing BLOCK_M re-derives the split count: the heuristic sizes
+            # num_kv_splits against the block count, so the two are not
+            # independent and overriding one alone would mis-size the grid.
+            _bm = _mqa_env_int("AITER_MQA_BLOCK_M", 0)
+            if _bm:
+                block_m = _bm
+                num_kv_splits = _gfx950_kv_splits(
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                )
+            num_kv_splits = _mqa_env_int("AITER_MQA_KV_SPLITS", num_kv_splits)
+
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
@@ -284,7 +321,7 @@ def fp8_mqa_logits(
                 "MFMA_NONK_DIM": mfma_nonk_dim,
                 "M_CHUNK": m_chunk,
                 # two KV tiles per loop body for the scheduler to interleave
-                "UNROLL": 2,
+                "UNROLL": _mqa_env_int("AITER_MQA_UNROLL", 2),
                 "RELAXED_STORE": relaxed_store,
                 "HAS_KV_SPLIT": 1 if num_kv_splits > 1 else 0,
                 "num_kv_splits": num_kv_splits,
