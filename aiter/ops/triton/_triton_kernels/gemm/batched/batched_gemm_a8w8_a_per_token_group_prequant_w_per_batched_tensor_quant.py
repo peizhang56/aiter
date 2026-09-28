@@ -211,11 +211,16 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # The grid is (B, cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N)), so B decides whether
+    # a tile fills the device: at B=8, M=96, N=512 the (M, N, K)-only config
+    # picks 64x256 and launches 32 workgroups onto 256 CUs. get_gemm_config
+    # falls back to the (N, K) file, so callers leaving B None are unaffected.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        B=B,
     )
