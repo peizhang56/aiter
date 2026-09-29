@@ -501,6 +501,169 @@ def test_paged_mqa_logits_large_kv_offsets(
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+)
+@pytest.mark.parametrize("block_size", [8, 16, 64, 128])
+@pytest.mark.parametrize("chunk_k", [128, 256])
+@pytest.mark.parametrize("padded_table", [False, True], ids=["compact", "padded"])
+@pytest.mark.parametrize(
+    "context_lengths,next_n,next_n_tile,heads,hidden_dim",
+    [
+        pytest.param((3000, 257, 3, 0), 4, 2, 64, 128, id="fold2"),
+        # 4-fold at 32 heads, not 64: heads * NextNTile <= 128 is the VGPR
+        # ceiling the wrapper enforces. Also the sparse-MLA indexer's shape.
+        pytest.param((3000, 257, 3, 0), 4, 4, 32, 128, id="fold4"),
+        pytest.param((1031, 64), 2, 2, 32, 128, id="fold2-decode"),
+        # Contexts at or below next_n push the per-row causal bound to zero,
+        # where a fold that drops the +_n term shows up.
+        pytest.param((2, 4, 5, 1), 4, 4, 32, 128, id="short-ctx"),
+    ],
+)
+@torch.inference_mode()
+def test_paged_mqa_logits_next_n_tile(
+    block_size: int,
+    chunk_k: int,
+    padded_table: bool,
+    context_lengths: tuple[int, ...],
+    next_n: int,
+    next_n_tile: int,
+    heads: int,
+    hidden_dim: int,
+) -> None:
+    """The fold must not move a logit: checked against an FP32 reference
+    and for exact equality with the unfolded launch."""
+    if (chunk_k // 2) % block_size != 0:
+        pytest.skip(
+            f"the fold needs (ChunkK // 2) % KVBlockSize == 0; {chunk_k}/{block_size}"
+        )
+
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260929)
+    fp8_dtype = dtypes.fp8
+    batch = len(context_lengths)
+    max_context = max(context_lengths)
+    max_pages = (max_context + block_size - 1) // block_size
+    num_blocks = 2 * max_pages + 3
+
+    q = torch.randn(
+        batch,
+        next_n,
+        heads,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(fp8_dtype)
+    kv = torch.randn(
+        num_blocks,
+        block_size,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(fp8_dtype)
+    scales = 0.25 + torch.rand(
+        num_blocks, block_size, generator=generator, device=device
+    )
+    weights = torch.randn(batch * next_n, heads, generator=generator, device=device)
+
+    packed = torch.empty(
+        num_blocks, block_size * (hidden_dim + 4), dtype=torch.uint8, device=device
+    )
+    value_bytes = block_size * hidden_dim
+    packed[:, :value_bytes] = (
+        shuffle_weight(kv, layout=(min(block_size, 16), 16))
+        .reshape(num_blocks, -1)
+        .view(torch.uint8)
+    )
+    packed[:, value_bytes:] = scales.view(torch.uint8)
+    cache = packed.view(num_blocks, block_size, 1, hidden_dim + 4)
+
+    table_width = max(4096, max_pages) if padded_table else max_pages
+    block_tables = torch.zeros(batch, table_width, dtype=torch.int32, device=device)
+    for b, context_length in enumerate(context_lengths):
+        pages = (context_length + block_size - 1) // block_size
+        block_tables[b, :pages] = torch.randperm(
+            num_blocks, generator=generator, device=device
+        )[:pages]
+    context_lens = torch.tensor(context_lengths, dtype=torch.int32, device=device)
+
+    guard = 16
+    sentinel = 12345.0
+
+    def run(tile: int) -> tuple[torch.Tensor, torch.Tensor]:
+        storage = torch.full(
+            (batch * next_n, max_context + 2 * guard), sentinel, device=device
+        )
+        view = storage[:, guard:-guard]
+        view.fill_(float("-inf"))
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            cache,
+            weights,
+            view,
+            context_lens,
+            block_tables,
+            max_context,
+            Preshuffle=True,
+            KVBlockSize=block_size,
+            ChunkK=chunk_k,
+            TotalCuCount=1,
+            WavePerEU=2,
+            NextNTile=tile,
+        )
+        return storage, view
+
+    storage, out = run(next_n_tile)
+    _, unfolded = run(1)
+
+    reference = torch.full_like(out, float("-inf"))
+    dequantized_kv = kv.float() * scales[..., None]
+    for b, context_length in enumerate(context_lengths):
+        if context_length == 0:
+            continue
+        pages = (context_length + block_size - 1) // block_size
+        page_ids = block_tables[b, :pages].long()
+        keys = dequantized_kv[page_ids].reshape(-1, hidden_dim)[:context_length]
+        scores = (q[b].float() @ keys.T).relu()
+        row_weights = weights[b * next_n : (b + 1) * next_n]
+        logits = (scores * row_weights[..., None]).sum(dim=1)
+        positions = torch.arange(context_length, device=device)
+        query_positions = context_length - next_n + torch.arange(next_n, device=device)
+        logits.masked_fill_(
+            positions[None, :] > query_positions[:, None], float("-inf")
+        )
+        reference[b * next_n : (b + 1) * next_n, :context_length] = logits
+
+    torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out, unfolded, rtol=0, atol=0)
+    assert torch.all(storage[:, :guard] == sentinel)
+    assert torch.all(storage[:, -guard:] == sentinel)
+
+
+@pytest.mark.parametrize(
+    "heads,next_n_tile", [(32, 8), (64, 4), (128, 2)], ids=["32x8", "64x4", "128x2"]
+)
+def test_paged_mqa_logits_next_n_tile_vgpr_guard(heads: int, next_n_tile: int) -> None:
+    """heads * NextNTile > 128 must be refused, not silently pessimised.
+    Rejected during argument validation, so the stubs need not be real."""
+    with pytest.raises(AssertionError, match=r"heads \* NextNTile"):
+        deepgemm_fp8_paged_mqa_logits(
+            torch.zeros(1, 8, heads, 128, dtype=dtypes.fp8, device=dev),
+            torch.zeros(1, 64, 1, 132, dtype=torch.uint8, device=dev),
+            torch.zeros(1, heads, device=dev),
+            torch.zeros(1, 64, device=dev),
+            torch.ones(1, dtype=torch.int32, device=dev),
+            torch.zeros(1, 1, dtype=torch.int32, device=dev),
+            64,
+            Preshuffle=True,
+            KVBlockSize=64,
+            NextNTile=next_n_tile,
+        )
+
+
 if __name__ == "__main__":
 
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))

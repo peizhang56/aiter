@@ -211,11 +211,14 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # The grid is (B, cdiv(M, BM) * cdiv(N, BN)), so B decides whether a tile
+    # fills the device. B=None falls back to the (N, K) file, as before.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        B=B,
     )

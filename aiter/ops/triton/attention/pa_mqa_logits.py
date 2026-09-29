@@ -266,6 +266,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
+    NextNTile: int = 1,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
@@ -329,6 +330,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
     fn_signature["ARCH"] = "constexpr"
+    # Only the plain preshuffle kernel declares NextNTile; the base and varctx
+    # kernels reject a constexpr they have no parameter for.
+    folds_next_n = Preshuffle and not VarCtxOpt
+    if folds_next_n:
+        fn_signature["NextNTile"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -365,17 +371,20 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
         )
     )
+    constexprs = {
+        "ChunkQ": ChunkQ,
+        "ChunkK": ChunkK,
+        "KVBlockSize": KVBlockSize,
+        "HiddenDim": HiddenDim,
+        "CDNA_VERSION": cdna_version,
+        "ARCH": gfx_version,
+    }
+    if folds_next_n:
+        constexprs["NextNTile"] = NextNTile
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
-        constexprs={
-            "ChunkQ": ChunkQ,
-            "ChunkK": ChunkK,
-            "KVBlockSize": KVBlockSize,
-            "HiddenDim": HiddenDim,
-            "CDNA_VERSION": cdna_version,
-            "ARCH": gfx_version,
-        },
+        constexprs=constexprs,
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
             (3,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q_buffer
@@ -476,11 +485,30 @@ def deepgemm_fp8_paged_mqa_logits(
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
+    NextNTile: int = 1,
 ):
+    # NextNTile folds that many `next_n` rows into one workgroup so they share
+    # one walk of the KV. The default 1 is the original grid and kernel.
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
+    if NextNTile != 1:
+        assert Preshuffle, "the NextNTile fold is implemented on the preshuffle path"
+        assert VarCtxSchedule is None, "NextNTile and the varctx schedule are exclusive"
+        assert (
+            next_n % NextNTile == 0
+        ), f"NextNTile={NextNTile} must divide next_n={next_n}"
+        assert (ChunkK // 2) % KVBlockSize == 0, (
+            "NextNTile > 1 needs the kernel's LoadBlockIndiceForEachStage branch, "
+            f"i.e. ChunkK // 2 % KVBlockSize == 0; got {ChunkK} / {KVBlockSize}"
+        )
+        # ChunkQ=heads here, so the fold keeps heads * NextNTile accumulators
+        # live; past 128 they spill the 256-VGPR file and undo the fold.
+        assert heads * NextNTile <= 128, (
+            f"NextNTile={NextNTile} at heads={heads} would spill VGPRs and run "
+            f"slower than NextNTile=1; heads * NextNTile must be <= 128"
+        )
     _, max_block_len = kv_indices.size()
 
     if get_gfx() == "gfx1250":
@@ -489,7 +517,7 @@ def deepgemm_fp8_paged_mqa_logits(
         else:
             WavePerEU = 1
 
-    TileQCount = batch_size * next_n
+    TileQCount = batch_size * (next_n // NextNTile)
     SplitKV = (
         (max(1, TotalCuCount // TileQCount) + 4)
         // 5
@@ -537,7 +565,7 @@ def deepgemm_fp8_paged_mqa_logits(
     if VarCtxOpt:
         grid = (TotalCuCount * WavePerEU, 1, 1)
     else:
-        grid = (batch_size * next_n * SplitKV, 1, 1)
+        grid = (batch_size * (next_n // NextNTile) * SplitKV, 1, 1)
 
     if enable_gluon_pa_mqa_logits:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
@@ -550,9 +578,11 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
+            NextNTile=NextNTile,
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
+            next_n_tile_args = (NextNTile,) if Preshuffle and not VarCtxOpt else ()
             kernel[grid](
                 batch_size,
                 next_n,
@@ -582,8 +612,10 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
+                *next_n_tile_args,
             )
         else:  #  load AOT compiled gluon kernel
+            assert NextNTile == 1, "the AOT gluon artifacts predate the NextNTile fold"
             assert triton_version < Version(
                 "3.4.0"
             ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
@@ -620,6 +652,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
     else:
+        assert NextNTile == 1, "the NextNTile fold is gluon-only"
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
         kv_cache_values = kv_cache_fp8.view(num_block, KVBlockSize, hidden_dim)
         kv_cache_scales = kv_cache_scale.view(num_block, KVBlockSize)

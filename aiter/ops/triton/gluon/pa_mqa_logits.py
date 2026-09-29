@@ -437,7 +437,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     KVBlockSize: gl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
     ARCH: gl.constexpr = "gfx942",
+    NextNTile: gl.constexpr = 1,
 ):
+    # NextNTile rows share one KV walk, reusing each loaded K tile across that
+    # many MFMAs. Legal: all rows of a batch walk the same range.
     IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
     # ===---------------------------------------------------
     # Gluon Layout
@@ -668,6 +671,12 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ChunkKStagePerContextBlock: gl.constexpr = KVBlockSize // ChunkKPerStage
 
     LoadBlockIndiceForEachStage: gl.constexpr = ChunkKPerStage % KVBlockSize == 0
+    # The fold is implemented only in this branch; the other still computes one
+    # row per workgroup, so folding there would drop rows.
+    tl.static_assert(
+        LoadBlockIndiceForEachStage or NextNTile == 1,
+        "NextNTile > 1 needs ChunkK // 2 % KVBlockSize == 0",
+    )
     # Rows per shuffled group, matching the `layout=(ShuffleRows, 16)` the host
     # passed to shuffle_weight. A page shorter than the 16-token MFMA tile can
     # only be shuffled in groups of its own length, so the tile is then read
@@ -687,7 +696,13 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     # ===---------------------------------------------------
     pid_batch, remain_pid = pid % batch_size, pid // batch_size
-    pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
+    # The grid carries next_n // NextNTile groups, so pid_next_n is the first
+    # row of this workgroup's group.
+    next_n_groups = next_n // NextNTile
+    pid_next_n, pid_split_kv = (
+        (remain_pid % next_n_groups) * NextNTile,
+        remain_pid // next_n_groups,
+    )
     # ===---------------------------------------------------
     context_length = gl.load(context_len_ptr + pid_batch)
 
@@ -720,16 +735,22 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         # Pipeline Start
         _amd_iglp_sched_barrier(0x0)
         # ===---------------------------------------------------
-        q = gl.amd.cdna3.buffer_load(
-            ptr=Q_buffer,
-            offsets=pid_batch * stride_q_batch
-            + pid_next_n * stride_q_next_n
-            + (
-                gl.arange(0, ChunkQ, layout=gl.SliceLayout(1, layout_q))
-                * stride_q_heads
-            )[:, None]
-            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_q))[None, :],
-        )
+        qs = ()
+        for _n in tl.static_range(NextNTile):
+            qs = qs + (
+                gl.amd.cdna3.buffer_load(
+                    ptr=Q_buffer,
+                    offsets=pid_batch * stride_q_batch
+                    + (pid_next_n + _n) * stride_q_next_n
+                    + (
+                        gl.arange(0, ChunkQ, layout=gl.SliceLayout(1, layout_q))
+                        * stride_q_heads
+                    )[:, None]
+                    + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_q))[
+                        None, :
+                    ],
+                ),
+            )
 
         context_idx = split_context_start - residual_context
 
@@ -761,11 +782,15 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             mask=mask_kv_next_1,
         )
 
-        scale_weight = gl.amd.cdna3.buffer_load(
-            ptr=weights,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_w_batch
-            + gl.arange(0, ChunkQ, layout=layout_scale),
-        )
+        scale_weights = ()
+        for _n in tl.static_range(NextNTile):
+            scale_weights = scale_weights + (
+                gl.amd.cdna3.buffer_load(
+                    ptr=weights,
+                    offsets=(pid_batch * next_n + pid_next_n + _n) * stride_w_batch
+                    + gl.arange(0, ChunkQ, layout=layout_scale),
+                ),
+            )
 
         offset_k_fixed = (
             gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) % 16
@@ -788,7 +813,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
         #!=----------------------------
-        mfma_q = gl.convert_layout(q, mfma_layout_a)
+        mfma_qs = ()
+        for _n in tl.static_range(NextNTile):
+            mfma_qs = mfma_qs + (gl.convert_layout(qs[_n], mfma_layout_a),)
 
         context_kv_idx_next_0 = tl.where(mask_kv_next_0, context_kv_idx_next_0, 0)
         k_next_0 = gl.load(
@@ -848,15 +875,14 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         _amd_s_set_prio(3)
         mfma_k = gl.convert_layout(k, mfma_layout_b)
-        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
-        _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+        _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
         _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-        _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+        _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
         _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-        _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+        _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
         _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-        _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+        _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
         _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
         #!=----------------------------
         _amd_iglp_sched_barrier(0x0)
@@ -864,22 +890,24 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         k_scale_f = gl.convert_layout(k_scale_f, gl.SliceLayout(0, mfma_layout))
 
-        o = o * k_scale_f[None, :]
-        o = gl.maximum(o, 0.0)
-        o = o * scale_weight[:, None]
-        _amd_s_set_prio(1)
-
-        logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         store_cols = context_idx + gl.arange(
             0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
         )
-        gl.amd.cdna3.buffer_store(
-            logits,
-            ptr=OutLogits_buffer
-            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-            offsets=store_cols,
-            mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
-        )
+        for _n in tl.static_range(NextNTile):
+            o = gl.amd.cdna3.mfma(mfma_qs[_n], mfma_k, zero)
+            o = o * k_scale_f[None, :]
+            o = gl.maximum(o, 0.0)
+            o = o * scale_weights[_n][:, None]
+            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+            gl.amd.cdna3.buffer_store(
+                logits,
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n + _n).to(tl.int64)
+                * stride_out_batch,
+                offsets=store_cols,
+                mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
+            )
+        _amd_s_set_prio(1)
 
         for context_idx in range(
             split_context_start - residual_context,
@@ -914,38 +942,40 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
             _amd_s_set_prio(3)
             mfma_k = gl.convert_layout(k, mfma_layout_b)
-            o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             #!=----------------------------
             _amd_iglp_sched_barrier(0x0)
             #!=----------------------------
             k_scale_f = gl.convert_layout(k_scale_f, gl.SliceLayout(0, mfma_layout))
-            o = o * k_scale_f[None, :]
-            o = gl.maximum(o, 0.0)
-            o = o * scale_weight[:, None]
-            _amd_s_set_prio(1)
-
-            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             store_cols = (
                 context_idx
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             )
-            gl.amd.cdna3.buffer_store(
-                logits,
-                ptr=OutLogits_buffer
-                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-                offsets=store_cols,
-                mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
-            )
+            for _n in tl.static_range(NextNTile):
+                o = gl.amd.cdna3.mfma(mfma_qs[_n], mfma_k, zero)
+                o = o * k_scale_f[None, :]
+                o = gl.maximum(o, 0.0)
+                o = o * scale_weights[_n][:, None]
+                logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+                gl.amd.cdna3.buffer_store(
+                    logits,
+                    ptr=OutLogits_buffer
+                    + (pid_batch * next_n + pid_next_n + _n).to(tl.int64)
+                    * stride_out_batch,
+                    offsets=store_cols,
+                    mask=(store_cols >= split_context_start)
+                    & (store_cols < max_model_len),
+                )
+            _amd_s_set_prio(1)
 
             # =======================================================================================
 
@@ -981,48 +1011,41 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             )
             _amd_s_set_prio(2)
             mfma_k = gl.convert_layout(k, mfma_layout_b)
-            o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
-            _amd_iglp_sched_group_barrier(MFMA, 8, 0)
+            _amd_iglp_sched_group_barrier(MFMA, 8 * NextNTile, 0)
             #!=----------------------------
             _amd_iglp_sched_barrier(0x0)
             #!=----------------------------
 
             k_scale_f = gl.convert_layout(k_scale_f, gl.SliceLayout(0, mfma_layout))
 
-            o = o * k_scale_f[None, :]
-            o = gl.maximum(o, 0.0)
-            o = o * scale_weight[:, None]
-            _amd_s_set_prio(0)
-
-            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
-            gl.amd.cdna3.buffer_store(
-                logits,
-                ptr=OutLogits_buffer
-                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-                offsets=(
-                    context_idx
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                ),
-                mask=(
-                    context_idx
-                    + ChunkK
-                    + gl.arange(
-                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
-                    )
-                )
-                < max_model_len,
+            store_cols = (
+                context_idx
+                + ChunkK
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             )
+            for _n in tl.static_range(NextNTile):
+                o = gl.amd.cdna3.mfma(mfma_qs[_n], mfma_k, zero)
+                o = o * k_scale_f[None, :]
+                o = gl.maximum(o, 0.0)
+                o = o * scale_weights[_n][:, None]
+                logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+                gl.amd.cdna3.buffer_store(
+                    logits,
+                    ptr=OutLogits_buffer
+                    + (pid_batch * next_n + pid_next_n + _n).to(tl.int64)
+                    * stride_out_batch,
+                    offsets=store_cols,
+                    mask=store_cols < max_model_len,
+                )
+            _amd_s_set_prio(0)
 
         context_idx = split_context_start + split_context_length - ChunkK
 
@@ -1031,34 +1054,33 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         _amd_s_set_prio(1)
         mfma_k = gl.convert_layout(k, mfma_layout_b)
-        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
         k_scale_f = gl.convert_layout(k_scale_f, gl.SliceLayout(0, mfma_layout))
-        o = o * k_scale_f[None, :]
-        o = gl.maximum(o, 0.0)
-        o = o * scale_weight[:, None]
         _amd_s_set_prio(0)
 
-        mask = (
-            context_idx
-            + ChunkKPerStage
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            <= context_length - next_n + pid_next_n
-        )
-
-        logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
-        logits = tl.where(mask, logits, float("-inf"))
         store_cols = (
             context_idx
             + ChunkKPerStage
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
         )
-        gl.amd.cdna3.buffer_store(
-            logits,
-            ptr=OutLogits_buffer
-            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
-            offsets=store_cols,
-            mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
-        )
+        for _n in tl.static_range(NextNTile):
+            o = gl.amd.cdna3.mfma(mfma_qs[_n], mfma_k, zero)
+            o = o * k_scale_f[None, :]
+            o = gl.maximum(o, 0.0)
+            o = o * scale_weights[_n][:, None]
+            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+            logits = tl.where(
+                store_cols <= context_length - next_n + pid_next_n + _n,
+                logits,
+                float("-inf"),
+            )
+            gl.amd.cdna3.buffer_store(
+                logits,
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n + _n).to(tl.int64)
+                * stride_out_batch,
+                offsets=store_cols,
+                mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
+            )
     else:
         context_idx = split_context_start
         current_chunk_rank = context_idx // ChunkKPerStage % ChunkKStagePerContextBlock
