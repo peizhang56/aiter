@@ -330,7 +330,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
     fn_signature["ARCH"] = "constexpr"
-    fn_signature["NextNTile"] = "constexpr"
+    # Only the plain preshuffle kernel declares NextNTile; the base and varctx
+    # kernels reject a constexpr they have no parameter for.
+    folds_next_n = Preshuffle and not VarCtxOpt
+    if folds_next_n:
+        fn_signature["NextNTile"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -367,18 +371,20 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
         )
     )
+    constexprs = {
+        "ChunkQ": ChunkQ,
+        "ChunkK": ChunkK,
+        "KVBlockSize": KVBlockSize,
+        "HiddenDim": HiddenDim,
+        "CDNA_VERSION": cdna_version,
+        "ARCH": gfx_version,
+    }
+    if folds_next_n:
+        constexprs["NextNTile"] = NextNTile
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
-        constexprs={
-            "ChunkQ": ChunkQ,
-            "ChunkK": ChunkK,
-            "KVBlockSize": KVBlockSize,
-            "HiddenDim": HiddenDim,
-            "CDNA_VERSION": cdna_version,
-            "ARCH": gfx_version,
-            "NextNTile": NextNTile,
-        },
+        constexprs=constexprs,
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
             (3,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q_buffer
@@ -571,6 +577,7 @@ def deepgemm_fp8_paged_mqa_logits(
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
+            next_n_tile_args = (NextNTile,) if Preshuffle and not VarCtxOpt else ()
             kernel[grid](
                 batch_size,
                 next_n,
@@ -600,7 +607,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
-                NextNTile,
+                *next_n_tile_args,
             )
         else:  #  load AOT compiled gluon kernel
             assert NextNTile == 1, "the AOT gluon artifacts predate the NextNTile fold"
