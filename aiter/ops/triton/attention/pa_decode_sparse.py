@@ -800,6 +800,13 @@ def _pa_decode_sparse_gfx950_gluon(
         unpeel = num_queries >= _PREFILL_MIN_ROWS
     else:
         unpeel = not (_TRITON_GE_38 and short_splits)
+    if packed_fp8:
+        # The fp8_dsv4_mla walk (_dsv4_segment) never reads UNPEEL (only the generic
+        # segment walk peels), so both values build the same binary. Pin it so the dead
+        # constexpr does not double the cached variants: short-context split-K decode
+        # (row_tiles <= 4 * splits) otherwise compiles a second, identical kernel the
+        # engine's warmup never reaches.
+        unpeel = True
 
     main_splits = num_splits
     if has_extra and avg_main > 0:

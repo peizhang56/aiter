@@ -566,6 +566,37 @@ def check_route_bucket_metadata(metadata, sorted_expert_ids, logger) -> None:
     )
 
 
+# ---- Route-output capture (m-moe-route-fold) --------------------------------
+#
+# A caller that reduces the routed output itself (vLLM's DeepSeek-V4 sequence-parallel INT4
+# reduce-scatter sums the per-slot MXFP8 rows on load) arms a capture around fused_moe: the next
+# route-output Stage2 with an MXFP8 route_out hands its per-slot rows [token*topk, md + md/8] uint8
+# to the capture and skips the slot reduce, leaving `out` unwritten. A bf16 route_out, an atomic
+# Stage2 or a disarmed capture run the ordinary path. Default: disarmed.
+
+
+class RouteOutputCapture:
+    __slots__ = ("armed", "route_out", "topk", "token_num")
+
+    def __init__(self):
+        self.armed = False
+        self.route_out = None
+        self.topk = 0
+        self.token_num = 0
+
+    def take(self):
+        r = (self.route_out, self.topk, self.token_num) if self.route_out is not None else None
+        self.route_out, self.topk, self.token_num = None, 0, 0
+        return r
+
+
+_ROUTE_CAPTURE = RouteOutputCapture()
+
+
+def route_output_capture() -> RouteOutputCapture:
+    return _ROUTE_CAPTURE
+
+
 # ---- Unified high-level Stage2 execution ----------------------------------
 
 
@@ -634,6 +665,12 @@ def opus_moe_stage2_a8w4_fwd(
         token_num=token_num,
         topk=topk,
     )
+    cap = _ROUTE_CAPTURE
+    if (cap.armed and cap.route_out is None and out is not None
+            and route_output.dtype == torch.uint8
+            and route_output.is_contiguous()):
+        cap.route_out, cap.topk, cap.token_num = route_output, int(topk), int(token_num)
+        return out
     return opus_moe_stage2_reduce_token_slot_route_output_fwd(
         route_output,
         out=out,
@@ -733,6 +770,8 @@ def opus_a8w4_stage2_wrapper(
 
 __all__ = [
     "OpusA8W4LaunchConfig",
+    "RouteOutputCapture",
+    "route_output_capture",
     "cfg_is_supported",
     "check_route_bucket_metadata",
     "is_opus_a8w4_stage2_kernel",
