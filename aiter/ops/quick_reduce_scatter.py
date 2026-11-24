@@ -16,9 +16,12 @@ def qr_reduce_scatter(
 ) -> None:
     """Write this rank's contiguous sum shard using the QuickReduce INT4 codec.
 
-    ``handle`` is an initialized four-rank QuickReduce communicator. ``input``
-    and ``output`` are contiguous FP16/BF16 tensors on the same GPU, with four
-    input elements per output element and a 16-byte-aligned output byte count.
-    BF16 inputs use FP16 communication arithmetic when ``cast_bf2half`` is set.
-    Calls sharing the communicator must be serialized on its current stream.
+    ``handle`` is an initialized four- or eight-rank QuickReduce communicator.
+    ``input`` and ``output`` are contiguous FP16/BF16 tensors on the same GPU
+    with 16-byte-aligned byte counts. Rank ``r`` receives the sum of elements
+    ``[r * S, (r + 1) * S)`` of every rank's ``input``, ``S = output.numel()``.
+    ``input`` may hold fewer than ``world_size * S`` elements; the rest reads
+    as zero. BF16 inputs use FP16 communication arithmetic when
+    ``cast_bf2half`` is set. Calls sharing the communicator must be serialized
+    on its current stream.
     """
