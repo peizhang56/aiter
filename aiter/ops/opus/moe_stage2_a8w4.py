@@ -571,6 +571,43 @@ def check_route_bucket_metadata(metadata, sorted_expert_ids, logger) -> None:
     )
 
 
+# ---- Route-output capture -------------------------------------------------
+#
+# A caller that reduces the routed output itself (e.g. a reduce-scatter that
+# sums the per-slot MXFP8 rows on load, qr_reduce_scatter_route) arms the
+# capture around fused_moe. The next route-output Stage2 with an MXFP8
+# route_out then hands its per-slot rows, uint8 [token * topk, md + md / 8],
+# to the capture and skips the slot reduce, leaving `out` unwritten. A bf16
+# route_out, a Stage2 without route output, or a disarmed capture runs the
+# ordinary path. Disarmed by default.
+
+
+class RouteOutputCapture:
+    __slots__ = ("armed", "route_out", "topk", "token_num")
+
+    def __init__(self):
+        self.armed = False
+        self.route_out = None
+        self.topk = 0
+        self.token_num = 0
+
+    def take(self) -> tuple[Tensor, int, int] | None:
+        """The captured (route_out, topk, token_num), or None; clears it."""
+        r = None
+        if self.route_out is not None:
+            r = (self.route_out, self.topk, self.token_num)
+        self.route_out, self.topk, self.token_num = None, 0, 0
+        return r
+
+
+_ROUTE_CAPTURE = RouteOutputCapture()
+
+
+def route_output_capture() -> RouteOutputCapture:
+    """The process-wide route-output capture (one per process, host-side)."""
+    return _ROUTE_CAPTURE
+
+
 # ---- Unified high-level Stage2 execution ----------------------------------
 
 
@@ -639,6 +676,16 @@ def opus_moe_stage2_a8w4_fwd(
         token_num=token_num,
         topk=topk,
     )
+    cap = _ROUTE_CAPTURE
+    if (
+        cap.armed
+        and cap.route_out is None
+        and out is not None
+        and route_output.dtype == torch.uint8
+        and route_output.is_contiguous()
+    ):
+        cap.route_out, cap.topk, cap.token_num = route_output, int(topk), int(token_num)
+        return out
     return opus_moe_stage2_reduce_token_slot_route_output_fwd(
         route_output,
         out=out,
@@ -738,6 +785,8 @@ def opus_a8w4_stage2_wrapper(
 
 __all__ = [
     "OpusA8W4LaunchConfig",
+    "RouteOutputCapture",
+    "route_output_capture",
     "cfg_is_supported",
     "check_route_bucket_metadata",
     "is_opus_a8w4_stage2_kernel",
